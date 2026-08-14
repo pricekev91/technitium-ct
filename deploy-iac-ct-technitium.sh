@@ -226,12 +226,12 @@ else
     echo "  WARNING: DNS port 53 on ${CONTAINER_IP} not yet listening. The service may still be starting."
 fi
 
-# Check web UI port 5380 on the container's dedicated IP
-echo "  [2/2] Checking Web UI (port 5380 on ${CONTAINER_IP})..."
-if prox "ss -tlnup | grep '${CONTAINER_IP}:5380 ' 2>/dev/null" | grep -q .; then
-    echo "      OK: Web UI port 5380 is listening on ${CONTAINER_IP}"
+# Check web UI port 80 on the container's dedicated IP
+echo "  [2/2] Checking Web UI (port 80 on ${CONTAINER_IP})..."
+if prox "ss -tlnup | grep '${CONTAINER_IP}:80 ' 2>/dev/null" | grep -q .; then
+    echo "      OK: Web UI port 80 is listening on ${CONTAINER_IP}"
 else
-    echo "  WARNING: Web UI port 5380 on ${CONTAINER_IP} not yet listening. The service may still be starting."
+    echo "  WARNING: Web UI port 80 on ${CONTAINER_IP} not yet listening. The service may still be starting."
 fi
 
 # ---------------------------------------------------------------
@@ -246,7 +246,7 @@ echo "============================================================"
 echo "  Deployment complete!"
 echo ""
 echo "  DNS:    ${CONTAINER_IP}:53 (TCP/UDP)"
-echo "  Web UI: http://${CONTAINER_IP}:5380"
+echo "  Web UI: http://${CONTAINER_IP}:80"
 echo ""
 echo "  NOTE: Ports are bound to ${CONTAINER_IP} only — no host conflict."
 echo "============================================================"

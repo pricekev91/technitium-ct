@@ -7,7 +7,7 @@ services:
       # Bind to the dedicated technitium IP only.
       - "192.168.1.2:53:53/tcp"
       - "192.168.1.2:53:53/udp"
-      - "192.168.1.2:5380:5380/tcp"
+      - "192.168.1.2:80:5380/tcp"
     volumes:
       # Host path /srv/data/technitium is mounted into the LXC at /srv/data (mp0).
       # The container maps that to /etc/dns where Technitium expects its config.
