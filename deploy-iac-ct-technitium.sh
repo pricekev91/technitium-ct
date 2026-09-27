@@ -57,9 +57,12 @@ if ! lxc "docker --version" >/dev/null 2>&1; then
 fi
 echo "      OK: $(lxc "docker --version")"
 
-echo "  [4/4] port 53 on ${CONTAINER_IP} free ..."
-if lxc "ss -tlnup 2>/dev/null" | grep -q "${CONTAINER_IP}:53 "; then
-    echo "ERROR: ${CONTAINER_IP}:53 is already in use inside LXC ${LXC_ID}."
+echo "  [4/4] ports 53/80 free on ${CONTAINER_IP} (and 0.0.0.0) ..."
+BLOCKING=$(lxc "ss -tlnup 2>/dev/null" | grep -E "(0\.0\.0\.0|\[::\]|${CONTAINER_IP}):(53|80) " || true)
+if [ -n "${BLOCKING}" ]; then
+    echo "ERROR: port 53/80 conflict - something is already bound inside LXC ${LXC_ID}:"
+    echo "${BLOCKING}"
+    echo "Hint: if dockhand is on 0.0.0.0:80, republish it to 192.168.1.9:80 instead."
     exit 1
 fi
 echo "      OK"
