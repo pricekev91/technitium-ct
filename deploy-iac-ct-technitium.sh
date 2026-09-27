@@ -1,241 +1,202 @@
 #!/bin/bash
 set -e
 
-# Configuration
+# =============================================================
+# Technitium DNS Server - DEPLOY (hlh-docker LXC, VMID 109)
+# KISS: plain docker run, no compose.
+#   1. pre-flight (ssh, CT running, docker, port 53 free)
+#   2. ensure 192.168.1.2/24 alias on eth0 (immediate + persistent unit)
+#   3. config present? (auto-runs configure script if not)
+#   4. image present? (pull if not)
+#   5. docker rm -f + docker run
+#   6. wait for running
+#   7. health checks: inside LXC (ss) + end-to-end from laptop (dig/curl)
+# Config sync lives in configure-iac-ct-technitium.sh.
+# =============================================================
+
 CONTAINER_NAME="technitium"
-LXC_ID="102"
-PROX_HOST="192.168.1.10"
-CONTAINER_IP="192.168.1.2"
-
-# /srv/data is mounted into the LXC (mp0) — use it as the shared config bridge.
-# Config files go here on the host; docker-compose mounts them into the container at /etc/dns.
+LXC_ID="109"                 # hlh-docker (was VMID 102 before re-provisioning)
+PROX_HOST="192.168.1.10"     # prox01
+CONTAINER_IP="192.168.1.2"   # dedicated Technitium IP (alias on LXC eth0)
+IMAGE="technitium/dns-server:latest"
 SHARED_DIR="/srv/data/technitium"
-
-# Detect repo path regardless of where script is run from
+ALIAS_UNIT="technitium-ipalias.service"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_PATH="$SCRIPT_DIR"
 
 # Helper: run commands inside the LXC
 lxc() { ssh root@${PROX_HOST} "pct exec ${LXC_ID} -- /bin/sh -c '$*'"; }
-
-# Helper: run commands on the Proxmox host (not inside LXC)
+# Helper: run commands on the Proxmox host
 prox() { ssh root@${PROX_HOST} "$*"; }
 
 echo "============================================================"
-echo "  Technitium DNS Server Deployment"
-echo "  Target: LXC ${LXC_ID} on ${PROX_HOST}"
+echo "  Technitium DNS Server - Deploy"
+echo "  LXC ${LXC_ID} (${CONTAINER_IP}) on ${PROX_HOST}"
 echo "============================================================"
 
 # ---------------------------------------------------------------
-# STEP 0: FREE PORT 53 (DISABLE SYSTEMD-RESOLVED)
+# PRE-FLIGHT
 # ---------------------------------------------------------------
 echo ""
-echo "--- Step 0: Ensuring port 53 is free ---"
-echo "  Disabling systemd-resolved to free port 53..."
-# Stop the service (masking prevents auto-restart)
-lxc "systemctl stop systemd-resolved" 2>/dev/null || true
-lxc "systemctl disable systemd-resolved" 2>/dev/null || true
-lxc "systemctl mask systemd-resolved" 2>/dev/null || true
-# Also disable the stub listener in config (belt and suspenders)
-lxc "sed -i 's/^DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf" 2>/dev/null || true
-lxc "systemctl daemon-reload" 2>/dev/null || true
-sleep 2
+echo "--- Pre-flight ---"
 
-# Verify port 53 is actually free
-echo "  Verifying port 53 is free..."
-if lxc "ss -tlnup | grep ':53 ' 2>/dev/null" | grep -qv 'docker\|technitium'; then
-    # Port 53 still occupied — try harder
-    echo "  WARNING: port 53 still occupied — attempting forced release..."
-    lxc "pkill -9 -f systemd-resolved" 2>/dev/null || true
-    lxc "systemctl stop systemd-resolved" 2>/dev/null || true
-    sleep 3
-    if lxc "ss -tlnup | grep ':53 ' 2>/dev/null" | grep -qv 'docker\|technitium'; then
-        echo "  ERROR: port 53 is STILL occupied. Container will fail to start."
-        echo "  Please manually stop systemd-resolved inside the LXC and retry."
-        exit 1
-    fi
-fi
-echo "  OK: port 53 is free"
-
-# ---------------------------------------------------------------
-# PRE-FLIGHT CHECKS
-# ---------------------------------------------------------------
-echo ""
-echo "--- Running pre-flight checks ---"
-
-# 1. Check docker is available inside the LXC
-echo "  [1/4] Checking docker is available..."
-if ! lxc "docker --version" >/dev/null 2>&1; then
-    echo "ERROR: docker is not installed or not in PATH inside LXC ${LXC_ID}."
-    echo "       Install docker first: https://docs.docker.com/engine/install/"
-    exit 1
-fi
-echo "      OK: docker found"
-
-# 2. Check docker compose is available
-echo "  [2/4] Checking docker compose is available..."
-if ! lxc "docker compose version" >/dev/null 2>&1; then
-    echo "ERROR: docker compose plugin is not available inside LXC ${LXC_ID}."
-    echo "       Install it first."
-    exit 1
-fi
-echo "      OK: docker compose found"
-
-# 3. Check connectivity to the Proxmox host
-echo "  [3/4] Checking connectivity to ${PROX_HOST}..."
+echo "  [1/4] SSH to ${PROX_HOST} ..."
 if ! ssh -o ConnectTimeout=5 -o BatchMode=yes root@${PROX_HOST} "echo ok" >/dev/null 2>&1; then
-    echo "ERROR: Cannot reach ${PROX_HOST}. Check SSH connectivity."
+    echo "ERROR: cannot reach ${PROX_HOST}."; exit 1
+fi
+echo "      OK"
+
+echo "  [2/4] LXC ${LXC_ID} running ..."
+if ! prox "pct status ${LXC_ID}" 2>/dev/null | grep -q running; then
+    echo "ERROR: LXC ${LXC_ID} is not running. Start it first: pct start ${LXC_ID}"; exit 1
+fi
+echo "      OK"
+
+echo "  [3/4] docker inside LXC ..."
+if ! lxc "docker --version" >/dev/null 2>&1; then
+    echo "ERROR: docker not available inside LXC ${LXC_ID}."; exit 1
+fi
+echo "      OK: $(lxc "docker --version")"
+
+echo "  [4/4] port 53 on ${CONTAINER_IP} free ..."
+if lxc "ss -tlnup 2>/dev/null" | grep -q "${CONTAINER_IP}:53 "; then
+    echo "ERROR: ${CONTAINER_IP}:53 is already in use inside LXC ${LXC_ID}."
     exit 1
 fi
-echo "      OK: SSH to ${PROX_HOST} successful"
+echo "      OK"
 
-# 4. Check that port 53 is not already bound to the container's dedicated IP
-echo "  [4/4] Checking that port 53 is free on ${CONTAINER_IP}..."
-if prox "ss -tlnup | grep '${CONTAINER_IP}:53 ' 2>/dev/null" | grep -q .; then
-    echo "WARNING: Port 53 on ${CONTAINER_IP} is already in use."
-    read -r -p "  Continue anyway? [y/N] " choice
-    case "$choice" in
-        [yY]*) ;;
-        *) echo "Aborted."; exit 1 ;;
-    esac
+# ---------------------------------------------------------------
+# STEP 1: DEDICATED IP ALIAS (192.168.1.2/24 on eth0)
+# ---------------------------------------------------------------
+# Port bindings target ${CONTAINER_IP} only, so the alias must exist on the
+# LXC's eth0. PVE rewrites the LXC network config from net0 (single IP
+# 192.168.1.9/24) on every CT start, so the alias is applied now AND made
+# persistent with a oneshot systemd unit that re-applies it at boot.
+echo ""
+echo "--- Step 1: Ensuring ${CONTAINER_IP}/24 alias on eth0 ---"
+lxc "ip addr replace ${CONTAINER_IP}/24 dev eth0"
+UNIT_B64=$(printf '%s\n' \
+  '[Unit]' \
+  "Description=Technitium secondary IP alias (${CONTAINER_IP}/24) on eth0" \
+  'After=network-online.target' \
+  'Wants=network-online.target' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'RemainAfterExit=yes' \
+  "ExecStart=/bin/sh -c 'ip addr replace ${CONTAINER_IP}/24 dev eth0'" \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  | base64 -w0)
+lxc "echo ${UNIT_B64} | base64 -d > /etc/systemd/system/${ALIAS_UNIT} && systemctl daemon-reload && systemctl enable --now ${ALIAS_UNIT}"
+if lxc "ip -4 addr show eth0" | grep -q "${CONTAINER_IP}/"; then
+    echo "  OK: alias present (persistent via ${ALIAS_UNIT})"
 else
-    echo "      OK: port 53 on ${CONTAINER_IP} is free"
+    echo "ERROR: could not add ${CONTAINER_IP}/24 to eth0 inside LXC ${LXC_ID}."; exit 1
 fi
 
 # ---------------------------------------------------------------
-# STEP 1: BACKUP EXISTING CONFIG
+# STEP 2: CONFIG PRESENT?
 # ---------------------------------------------------------------
 echo ""
-echo "--- Step 1: Backing up existing Technitium config ---"
-if lxc "test -d /etc/dns" 2>/dev/null; then
-    BACKUP_DIR="/etc/dns_backup_$(date +%Y%m%d_%H%M%S)"
-    echo "  Backing up /etc/dns to ${BACKUP_DIR} ..."
-    lxc "cp -a /etc/dns ${BACKUP_DIR}"
-    echo "  Backup complete: ${BACKUP_DIR}"
+echo "--- Step 2: Checking config in ${SHARED_DIR} ---"
+if ! lxc "test -f ${SHARED_DIR}/Dns.conf" 2>/dev/null; then
+    echo "  No config found - running configure-iac-ct-technitium.sh ..."
+    "${SCRIPT_DIR}/configure-iac-ct-technitium.sh"
+fi
+echo "  OK: config present"
+
+# ---------------------------------------------------------------
+# STEP 3: IMAGE
+# ---------------------------------------------------------------
+echo ""
+echo "--- Step 3: Image ${IMAGE} ---"
+if lxc "docker image inspect ${IMAGE} >/dev/null 2>&1"; then
+    echo "  OK: image present"
 else
-    echo "  No existing /etc/dns directory found. Skipping backup."
+    echo "  Pulling ..."
+    lxc "docker pull ${IMAGE}"
+    echo "  OK: image pulled"
 fi
 
 # ---------------------------------------------------------------
-# STEP 2: ENSURE SHARED CONFIG DIRECTORY EXISTS AND HAS CORRECT PERMISSIONS
-# ---------------------------------------------------------------
-echo ""
-echo "--- Step 2: Ensuring shared config directory exists ---"
-# Technitium runs as user 'dns' (UID 1234, GID 1234) inside the container.
-# For unprivileged LXCs, the container's UID 1234 maps to host UID
-# (base_mapping + 1234). Detect the base mapping from /etc/subuid so
-# we chown correctly on the host regardless of whether the LXC is
-# privileged or unprivileged.
-UNPRIVILEGED=$(prox "pct config ${LXC_ID}" 2>/dev/null | grep -q '^unprivileged: 1' && echo 1 || echo 0)
-if [ "$UNPRIVILEGED" = "1" ]; then
-    # Unprivileged LXC: container UID maps through user ns
-    # Container uid 1234 -> host uid = base_mapping + 1234
-    # Base mapping is typically 100000 (from /etc/subuid on the host)
-    HOST_UID=$((100000 + 1234))
-    HOST_GID=$((100000 + 1234))
-else
-    # Privileged LXC: host UID == container UID
-    HOST_UID=1234
-    HOST_GID=1234
-fi
-
-prox "mkdir -p ${SHARED_DIR}"
-prox "chown ${HOST_UID}:${HOST_GID} ${SHARED_DIR}"
-prox "chmod 755 ${SHARED_DIR}"
-echo "  OK: ${SHARED_DIR} ready (host uid/gid ${HOST_UID}:${HOST_GID}, maps to container dns user)"
-
-# ---------------------------------------------------------------
-# STEP 3: SYNC CONFIG FILES
-# ---------------------------------------------------------------
-echo ""
-echo "--- Step 3: Syncing configuration files ---"
-# Copy config files to shared dir on host
-scp -o StrictHostKeyChecking=accept-new "${REPO_PATH}"/config/Dns.conf root@${PROX_HOST}:${SHARED_DIR}/ 2>/dev/null || true
-scp -o StrictHostKeyChecking=accept-new "${REPO_PATH}"/config/Settings.json root@${PROX_HOST}:${SHARED_DIR}/ 2>/dev/null || true
-# Copy docker-compose.yml into shared dir for the LXC to read
-scp -o StrictHostKeyChecking=accept-new "${REPO_PATH}"/docker-compose.yml root@${PROX_HOST}:${SHARED_DIR}/docker-compose.yml
-
-# SCP files arrive as root:root — re-apply the correct ownership so the
-# container's 'dns' user can read/write the mount (including creating
-# subdirectories like /etc/dns/blocklists, /etc/dns/data, etc.).
-prox "chown -R ${HOST_UID}:${HOST_GID} ${SHARED_DIR}"
-
-echo "  OK: Config files synced"
-
-# ---------------------------------------------------------------
-# STEP 4: REMOVE EXISTING CONTAINER (IF ANY)
+# STEP 4: REMOVE OLD CONTAINER (IF ANY)
 # ---------------------------------------------------------------
 echo ""
 echo "--- Step 4: Removing existing container (if any) ---"
-lxc "docker rm -f ${CONTAINER_NAME}" 2>/dev/null || true
+lxc "docker rm -f ${CONTAINER_NAME} 2>/dev/null" || true
+echo "  OK"
 
 # ---------------------------------------------------------------
-# STEP 5: DEPLOY VIA DOCKER-COMPOSE (INSIDE LXC)
+# STEP 5: DOCKER RUN (no compose)
 # ---------------------------------------------------------------
 echo ""
-echo "--- Step 5: Deploying via Docker Compose ---"
-# Run docker-compose inside the LXC.
-# docker-compose.yml volume mount: /srv/data/technitium (host) -> /etc/dns (container)
-# The LXC has /srv/data mounted from the host via mp0.
-lxc "cd ${SHARED_DIR} && docker compose -f ${SHARED_DIR}/docker-compose.yml up -d"
+echo "--- Step 5: Starting container ---"
+lxc "docker run -d --name ${CONTAINER_NAME} --restart always --cap-add NET_ADMIN -p ${CONTAINER_IP}:53:53/tcp -p ${CONTAINER_IP}:53:53/udp -p ${CONTAINER_IP}:80:5380/tcp -v ${SHARED_DIR}:/etc/dns ${IMAGE}"
+echo "  OK: container created"
 
 # ---------------------------------------------------------------
-# STEP 6: WAIT FOR CONTAINER TO START
+# STEP 6: WAIT FOR RUNNING
 # ---------------------------------------------------------------
 echo ""
 echo "--- Step 6: Waiting for container to start ---"
-MAX_WAIT=90
-ELAPSED=0
 IS_RUNNING=false
-
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-    STATUS=$(lxc "docker ps -q --filter name=${CONTAINER_NAME}" 2>/dev/null || true)
-    if [ -n "$STATUS" ]; then
-        CONTAINER_STATE=$(lxc "docker inspect -f '{{.State.Status}}' ${CONTAINER_NAME}" 2>/dev/null || true)
-        if [ "$CONTAINER_STATE" = "running" ]; then
-            echo "  Container is running."
-            IS_RUNNING=true
-            break
-        fi
+for i in $(seq 1 18); do
+    RUNNING_ID=$(lxc "docker ps -q --filter name=${CONTAINER_NAME} --filter status=running" 2>/dev/null || true)
+    if [ -n "${RUNNING_ID}" ]; then
+        IS_RUNNING=true
+        break
     fi
     sleep 5
-    ELAPSED=$((ELAPSED + 5))
+done
+if [ "${IS_RUNNING}" != "true" ]; then
+    echo "ERROR: container not running after 90s. Logs:"
+    lxc "docker logs ${CONTAINER_NAME} 2>&1 | tail -30"
+    exit 1
+fi
+echo "  OK: running"
+
+# ---------------------------------------------------------------
+# STEP 7: HEALTH CHECKS
+# ---------------------------------------------------------------
+echo ""
+echo "--- Step 7: Health checks ---"
+DNS_OK=false
+UI_OK=false
+for i in $(seq 1 6); do
+    # Inside the LXC: ports bound on the dedicated IP
+    if [ "${DNS_OK}" = "false" ] && lxc "ss -tlnup 2>/dev/null" | grep -q "${CONTAINER_IP}:53 "; then
+        DNS_OK=true
+    fi
+    if [ "${UI_OK}" = "false" ] && lxc "ss -tlnup 2>/dev/null" | grep -q "${CONTAINER_IP}:80 "; then
+        UI_OK=true
+    fi
+    # End-to-end from this machine (crosses vmbr0 into the LXC netns)
+    if [ "${DNS_OK}" = "false" ] && dig +time=2 +tries=1 @"${CONTAINER_IP}" mizertech.net SOA +short 2>/dev/null | grep -q .; then
+        DNS_OK=true
+    fi
+    if [ "${UI_OK}" = "false" ]; then
+        CODE=$(curl -s -o /dev/null --max-time 4 -w '%{http_code}' "http://${CONTAINER_IP}/" 2>/dev/null || true)
+        case "${CODE}" in 2*|3*) UI_OK=true ;; esac
+    fi
+    if [ "${DNS_OK}" = "true" ] && [ "${UI_OK}" = "true" ]; then
+        break
+    fi
+    sleep 5
 done
 
-if [ "$IS_RUNNING" = false ]; then
-    echo "ERROR: Container ${CONTAINER_NAME} failed to start within ${MAX_WAIT} seconds."
-    echo "--- Container Logs ---"
+echo "  [1/2] DNS (port 53 on ${CONTAINER_IP}):    $([ "${DNS_OK}" = "true" ] && echo OK || echo NOT RESPONDING)"
+echo "  [2/2] Web UI (port 80 on ${CONTAINER_IP}): $([ "${UI_OK}" = "true" ] && echo OK || echo NOT RESPONDING)"
+
+if [ "${DNS_OK}" != "true" ] || [ "${UI_OK}" != "true" ]; then
+    echo ""
+    echo "ERROR: health checks failed. Container logs:"
     lxc "docker logs ${CONTAINER_NAME} 2>&1 | tail -30"
     exit 1
 fi
 
 # ---------------------------------------------------------------
-# STEP 7: SERVICE-LEVEL HEALTH CHECKS
-# ---------------------------------------------------------------
-echo ""
-echo "--- Step 7: Service-level health checks ---"
-
-# Wait a bit for DNS and web UI to be ready
-sleep 10
-
-# Check DNS port 53 is listening on the container's dedicated IP
-echo "  [1/2] Checking DNS service (port 53 on ${CONTAINER_IP})..."
-if prox "ss -tlnup | grep '${CONTAINER_IP}:53 ' 2>/dev/null" | grep -q .; then
-    echo "      OK: DNS port 53 is listening on ${CONTAINER_IP}"
-else
-    echo "  WARNING: DNS port 53 on ${CONTAINER_IP} not yet listening. The service may still be starting."
-fi
-
-# Check web UI port 80 on the container's dedicated IP
-echo "  [2/2] Checking Web UI (port 80 on ${CONTAINER_IP})..."
-if prox "ss -tlnup | grep '${CONTAINER_IP}:80 ' 2>/dev/null" | grep -q .; then
-    echo "      OK: Web UI port 80 is listening on ${CONTAINER_IP}"
-else
-    echo "  WARNING: Web UI port 80 on ${CONTAINER_IP} not yet listening. The service may still be starting."
-fi
-
-# ---------------------------------------------------------------
-# STEP 8: SHOW STATUS
+# STEP 8: STATUS
 # ---------------------------------------------------------------
 echo ""
 echo "--- Container Status ---"
@@ -243,15 +204,13 @@ lxc "docker ps --filter name=${CONTAINER_NAME}"
 
 echo ""
 echo "============================================================"
-echo "  Deployment complete!"
+echo "  Deploy complete!"
 echo ""
 echo "  DNS:    ${CONTAINER_IP}:53 (TCP/UDP)"
-echo "  Web UI: http://${CONTAINER_IP}:80"
+echo "  Web UI: http://${CONTAINER_IP}/  (API: http://${CONTAINER_IP}/api/)"
 echo ""
-echo "  NOTE: Ports are bound to ${CONTAINER_IP} only — no host conflict."
+echo "  Config: ${SHARED_DIR} (mounted to /etc/dns in container)"
+echo "  Ports bound to ${CONTAINER_IP} only - no host conflict."
 echo "============================================================"
-echo ""
-echo "  Config files are in: ${SHARED_DIR}/ on the host"
-echo "  (Mounted into the container at /etc/dns via docker-compose)"
 
 exit 0
